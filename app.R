@@ -20,7 +20,10 @@ ui <- fluidPage(
     mainPanel(
       h3("Simulation Results"),
       tableOutput("summary_table"),
-      plotOutput("lambda_effect_plot")
+      plotOutput("mse_plot"),
+      plotOutput("bias_plot"),
+      plotOutput("variance_plot"),
+      plotOutput("bv_tradeoff_plot")
     )
   )
 )
@@ -46,9 +49,9 @@ server <- function(input, output) {
     
     true_beta <- c(runif(5, 0.5, 1), rep(0, p - 5))
     
-    lambda_seq <- 10^seq(-4, 0, length.out = 100) # Lambda values for LASSO
-    mse_lasso <- sum_beta <- dropped_covariates <- matrix(0, nrow = n_sim, ncol = length(lambda_seq))
-    optimal_lambdas <- numeric(n_sim)
+    mse_ols <- mse_lasso_cv <- numeric(n_sim)
+    bias_ols <- bias_lasso_cv <- numeric(n_sim)
+    variance_ols <- variance_lasso_cv <- numeric(n_sim)
     
     withProgress(message = "Running Simulations...", value = 0, {
       for (i in seq_len(n_sim)) {
@@ -61,77 +64,96 @@ server <- function(input, output) {
         Y_train <- X_train %*% true_beta + epsilon_train
         Y_test <- X_test %*% true_beta + epsilon_test
         
-        # LASSO with cross-validation
-        lasso_model_cv <- cv.glmnet(X_train, Y_train, alpha = 1, lambda = lambda_seq)
-        optimal_lambdas[i] <- lasso_model_cv$lambda.min
+        ols_model <- lm(Y_train ~ ., data = as.data.frame(X_train))
+        ols_predictions <- predict(ols_model, newdata = as.data.frame(X_test))
+        mse_ols[i] <- mean((Y_test - ols_predictions)^2)
+        bias_ols[i] <- mean(Y_test - ols_predictions)
+        variance_ols[i] <- var(ols_predictions)
         
-        for (j in seq_along(lambda_seq)) {
-          lasso_predictions <- predict(lasso_model_cv, newx = X_test, s = lambda_seq[j])
-          mse_lasso[i, j] <- mean((Y_test - lasso_predictions)^2)
-          
-          # Calculate the sum of absolute beta coefficients
-          beta_coeff <- coef(lasso_model_cv, s = lambda_seq[j])[-1]  # Exclude intercept
-          sum_beta[i, j] <- sum(abs(beta_coeff))
-          
-          # Count the number of non-zero coefficients
-          coef_count <- sum(beta_coeff != 0)
-          dropped_covariates[i, j] <- p - coef_count
-        }
+        lasso_model_cv <- cv.glmnet(X_train, Y_train, alpha = 1)
+        lasso_predictions_cv <- predict(lasso_model_cv, newx = X_test, s = "lambda.min")
+        mse_lasso_cv[i] <- mean((Y_test - lasso_predictions_cv)^2)
+        bias_lasso_cv[i] <- mean(Y_test - lasso_predictions_cv)
+        variance_lasso_cv[i] <- var(lasso_predictions_cv)
       }
     })
     
     list(
-      lambda_seq = lambda_seq,
-      mse_lasso = mse_lasso,
-      sum_beta = sum_beta,
-      dropped_covariates = dropped_covariates,
-      optimal_lambdas = optimal_lambdas
+      mse_ols = mse_ols,
+      mse_lasso_cv = mse_lasso_cv,
+      bias_ols = bias_ols,
+      bias_lasso_cv = bias_lasso_cv,
+      variance_ols = variance_ols,
+      variance_lasso_cv = variance_lasso_cv
     )
   })
   
   # Generate summary table
   output$summary_table <- renderTable({
     results <- simulation_results()
-    lambda_avg <- mean(results$optimal_lambdas)
-    avg_dropped_covariates <- mean(results$dropped_covariates[, which.min(colMeans(results$mse_lasso))])
-    avg_sum_beta <- mean(results$sum_beta[, which.min(colMeans(results$mse_lasso))])
     data.frame(
-      Metric = c("Average Optimal Lambda", "Average Covariates Dropped", "Average Sum of Beta Coefficients"),
-      Value = c(lambda_avg, avg_dropped_covariates, avg_sum_beta)
+      Metric = c("MSE", "Bias", "Variance"),
+      OLS_Mean = c(mean(results$mse_ols), mean(results$bias_ols), mean(results$variance_ols)),
+      OLS_SD = c(sd(results$mse_ols), sd(results$bias_ols), sd(results$variance_ols)),
+      LASSO_Mean = c(mean(results$mse_lasso_cv), mean(results$bias_lasso_cv), mean(results$variance_lasso_cv)),
+      LASSO_SD = c(sd(results$mse_lasso_cv), sd(results$bias_lasso_cv), sd(results$variance_lasso_cv))
     )
   }, rownames = FALSE)
   
-  # Plot the effect of lambda on MSE, Sum of Betas, and Dropped Covariates
-  output$lambda_effect_plot <- renderPlot({
+  # Kernel Density Plots
+  output$mse_plot <- renderPlot({
     results <- simulation_results()
-    lambda_seq <- results$lambda_seq
-    mse_mean <- colMeans(results$mse_lasso)
-    sum_beta_mean <- colMeans(results$sum_beta)
-    dropped_covariates_mean <- colMeans(results$dropped_covariates)
-    optimal_lambda <- mean(results$optimal_lambdas)
-    
     df <- data.frame(
-      Lambda = lambda_seq,
-      MSE = mse_mean,
-      SumBeta = sum_beta_mean,
-      DroppedCovariates = dropped_covariates_mean
+      Model = rep(c("OLS", "LASSO (CV)"), each = length(results$mse_ols)),
+      MSE = c(results$mse_ols, results$mse_lasso_cv)
     )
-    
-    ggplot(df, aes(x = Lambda)) +
-      geom_line(aes(y = MSE, color = "MSE"), size = 1.2) +
-      geom_line(aes(y = SumBeta, color = "Sum of Betas"), size = 1.2) +
-      geom_line(aes(y = DroppedCovariates, color = "Covariates Dropped"), size = 1.2) +
-      scale_y_continuous(
-        name = "MSE / Sum of Betas",
-        sec.axis = sec_axis(~ ., name = "Average Covariates Dropped")
-      ) +
-      scale_x_log10() +
-      geom_vline(xintercept = optimal_lambda, linetype = "dashed", color = "red", size = 1) +
-      labs(title = "Effect of Lambda on MSE, Sum of Betas, and Dropped Covariates",
-           x = "Lambda (log scale)", color = "Metric") +
-      theme_minimal()
+    ggplot(df, aes(x = MSE, fill = Model)) +
+      geom_density(alpha = 0.5) +
+      labs(title = "MSE Density", x = "MSE", y = "Density") +
+      scale_fill_manual(values = c("red", "yellow"))
+  })
+  
+  output$bias_plot <- renderPlot({
+    results <- simulation_results()
+    df <- data.frame(
+      Model = rep(c("OLS", "LASSO (CV)"), each = length(results$bias_ols)),
+      Bias = c(results$bias_ols, results$bias_lasso_cv)
+    )
+    ggplot(df, aes(x = Bias, fill = Model)) +
+      geom_density(alpha = 0.5) +
+      labs(title = "Bias Density", x = "Bias", y = "Density") +
+      scale_fill_manual(values = c("red", "yellow"))
+  })
+  
+  output$variance_plot <- renderPlot({
+    results <- simulation_results()
+    df <- data.frame(
+      Model = rep(c("OLS", "LASSO (CV)"), each = length(results$variance_ols)),
+      Variance = c(results$variance_ols, results$variance_lasso_cv)
+    )
+    ggplot(df, aes(x = Variance, fill = Model)) +
+      geom_density(alpha = 0.5) +
+      labs(title = "Variance Density", x = "Variance", y = "Density") +
+      scale_fill_manual(values = c("red", "yellow"))
+  })
+  
+  output$bv_tradeoff_plot <- renderPlot({
+    results <- simulation_results()
+    df <- data.frame(
+      Metric = rep(c("MSE", "Bias", "Variance"), each = length(results$mse_ols) * 2),
+      Model = rep(c("OLS", "LASSO (CV)"), times = 3 * length(results$mse_ols)),
+      Value = c(results$mse_ols, results$mse_lasso_cv,
+                results$bias_ols, results$bias_lasso_cv,
+                results$variance_ols, results$variance_lasso_cv)
+    )
+    ggplot(df, aes(x = Value, fill = Model)) +
+      geom_density(alpha = 0.5) +
+      facet_wrap(~ Metric, scales = "free", ncol = 1) +
+      labs(title = "Bias-Variance Tradeoff (Density)", x = "Value", y = "Density") +
+      scale_fill_manual(values = c("red", "yellow"))
   })
 }
 
 # Run the application
 shinyApp(ui = ui, server = server)
+
